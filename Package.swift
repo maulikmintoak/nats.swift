@@ -9,8 +9,7 @@ let package = Package(
         .iOS(.v13),
     ],
     products: [
-        .library(name: "Nats", targets: ["Nats"]),
-        .library(name: "JetStream", targets: ["JetStream"])
+        .library(name: "Nats", targets: ["Nats"])
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-nio.git", from: "2.70.0"),
@@ -32,22 +31,9 @@ let package = Package(
                 .product(name: "NKeys", package: "nkeys.swift"),
                 .product(name: "Nuid", package: "swift-nuid"),
             ]),
-        .target(
-            name: "JetStream",
-            dependencies: [
-                "Nats",
-                .product(name: "Logging", package: "swift-log"),
-            ]),
         .testTarget(
                 name: "NatsTests",
                 dependencies: ["Nats"],
-                resources: [
-                .process("Integration/Resources")
-                ]
-        ),
-        .testTarget(
-                name: "JetStreamTests",
-                dependencies: ["Nats", "JetStream"],
                 resources: [
                 .process("Integration/Resources")
                 ]
