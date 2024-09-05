@@ -605,6 +605,16 @@ class ConnectionHandler: ChannelInboundHandler {
         self.reconnectTask?.cancel()
         await self.reconnectTask?.value
 
+        self.serverInfoContinuation?.resume(throwing: NatsClientError("Connection closed"))
+        self.serverInfoContinuation = nil
+
+        self.connectionEstablishedContinuation?.resume(throwing: NatsClientError("Connection closed"))
+        self.connectionEstablishedContinuation = nil
+        
+         // Clear input buffer and remainder
+        self.parseRemainder = nil
+        inputBuffer.clear()
+        
         guard let eventLoop = self.channel?.eventLoop else {
             throw NatsError.ClientError.internalError("channel should not be nil")
         }
