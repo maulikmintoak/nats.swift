@@ -605,16 +605,6 @@ class ConnectionHandler: ChannelInboundHandler {
         self.reconnectTask?.cancel()
         await self.reconnectTask?.value
 
-        self.serverInfoContinuation?.resume(throwing: NatsClientError("Connection closed"))
-        self.serverInfoContinuation = nil
-
-        self.connectionEstablishedContinuation?.resume(throwing: NatsClientError("Connection closed"))
-        self.connectionEstablishedContinuation = nil
-        
-         // Clear input buffer and remainder
-        self.parseRemainder = nil
-        inputBuffer.clear()
-        
         guard let eventLoop = self.channel?.eventLoop else {
             throw NatsError.ClientError.internalError("channel should not be nil")
         }
@@ -829,11 +819,13 @@ class ConnectionHandler: ChannelInboundHandler {
         }
     }
 
-    internal func subscribe(_ subject: String) async throws -> NatsSubscription {
+    internal func subscribe(
+        _ subject: String, queue: String? = nil
+    ) async throws -> NatsSubscription {
         let sid = self.subscriptionCounter.wrappingIncrementThenLoad(
             ordering: AtomicUpdateOrdering.relaxed)
-        try await write(operation: ClientOp.subscribe((sid, subject, nil)))
-        let sub = NatsSubscription(sid: sid, subject: subject, conn: self)
+        let sub = try NatsSubscription(sid: sid, subject: subject, queue: queue, conn: self)
+        try await write(operation: ClientOp.subscribe((sid, subject, queue)))
         self.subscriptions[sid] = sub
         return sub
     }
