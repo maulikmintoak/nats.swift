@@ -12,10 +12,10 @@ let package = Package(
         .library(name: "Nats", targets: ["Nats"])
     ],
     dependencies: [
-        .package(url: "https://github.com/apple/swift-nio.git", from: "2.70.0"),
+        .package(url: "https://github.com/apple/swift-nio.git", from: "2.74.0"),
         .package(url: "https://github.com/apple/swift-log.git", from: "1.6.1"),
         .package(url: "https://github.com/nats-io/nkeys.swift.git", from: "0.1.2"),
-        .package(url: "https://github.com/apple/swift-nio-ssl.git", from: "2.27.1"),
+        .package(url: "https://github.com/apple/swift-nio-ssl.git", from: "2.27.2"),
         .package(url: "https://github.com/Jarema/swift-nuid.git", from: "0.2.0"),
     ],
     targets: [
