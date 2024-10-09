@@ -795,11 +795,11 @@ class ConnectionHandler: ChannelInboundHandler {
                 return
             }
             for (sid, sub) in self.subscriptions {
-                do {
-                    try await write(operation: ClientOp.subscribe((sid, sub.subject, nil)))
-                } catch {
-                    logger.error("error recreating subscription \(sid): \(error)")
-                }
+                // do {
+                //     try await write(operation: ClientOp.subscribe((sid, sub.subject, nil)))
+                // } catch {
+                //     logger.error("error recreating subscription \(sid): \(error)")
+                // }
             }
             self.channel?.eventLoop.execute {
                 self.state = .connected
@@ -819,30 +819,30 @@ class ConnectionHandler: ChannelInboundHandler {
         }
     }
 
-    internal func subscribe(
-        _ subject: String, queue: String? = nil
-    ) async throws -> NatsSubscription {
-        let sid = self.subscriptionCounter.wrappingIncrementThenLoad(
-            ordering: AtomicUpdateOrdering.relaxed)
-        let sub = try NatsSubscription(sid: sid, subject: subject, queue: queue, conn: self)
-        try await write(operation: ClientOp.subscribe((sid, subject, queue)))
-        self.subscriptions[sid] = sub
-        return sub
-    }
+    // internal func subscribe(
+    //     _ subject: String, queue: String? = nil
+    // ) async throws -> NatsSubscription {
+    //     let sid = self.subscriptionCounter.wrappingIncrementThenLoad(
+    //         ordering: AtomicUpdateOrdering.relaxed)
+    //     let sub = try NatsSubscription(sid: sid, subject: subject, queue: queue, conn: self)
+    //     try await write(operation: ClientOp.subscribe((sid, subject, queue)))
+    //     self.subscriptions[sid] = sub
+    //     return sub
+    // }
 
-    internal func unsubscribe(sub: NatsSubscription, max: UInt64?) async throws {
-        if let max, sub.delivered < max {
-            // if max is set and the sub has not yet reached it, send unsub with max set
-            // and do not remove the sub from connection
-            try await write(operation: ClientOp.unsubscribe((sid: sub.sid, max: max)))
-            sub.max = max
-        } else {
-            // if max is not set or the subscription received at least as meny
-            // messages as max, send unsub command without max and remove sub from connection
-            try await write(operation: ClientOp.unsubscribe((sid: sub.sid, max: nil)))
-            self.removeSub(sub: sub)
-        }
-    }
+    // internal func unsubscribe(sub: NatsSubscription, max: UInt64?) async throws {
+    //     if let max, sub.delivered < max {
+    //         // if max is set and the sub has not yet reached it, send unsub with max set
+    //         // and do not remove the sub from connection
+    //         try await write(operation: ClientOp.unsubscribe((sid: sub.sid, max: max)))
+    //         sub.max = max
+    //     } else {
+    //         // if max is not set or the subscription received at least as meny
+    //         // messages as max, send unsub command without max and remove sub from connection
+    //         try await write(operation: ClientOp.unsubscribe((sid: sub.sid, max: nil)))
+    //         self.removeSub(sub: sub)
+    //     }
+    // }
 
     internal func removeSub(sub: NatsSubscription) {
         self.subscriptions.removeValue(forKey: sub.sid)
