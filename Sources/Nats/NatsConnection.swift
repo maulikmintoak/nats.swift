@@ -134,7 +134,7 @@ class ConnectionHandler: ChannelInboundHandler {
         for op in parseResult.ops {
             if let continuation = self.serverInfoContinuation {
                 self.serverInfoContinuation = nil
-                logger.debug("server info")
+                logger.debug("Nats ---->server info")
                 switch op {
                 case .error(let err):
                     continuation.resume(throwing: err)
@@ -148,7 +148,7 @@ class ConnectionHandler: ChannelInboundHandler {
 
             if let continuation = self.connectionEstablishedContinuation {
                 self.connectionEstablishedContinuation = nil
-                logger.debug("conn established")
+                logger.debug("Nats ---->conn established")
                 switch op {
                 case .error(let err):
                     continuation.resume(throwing: err)
@@ -160,7 +160,7 @@ class ConnectionHandler: ChannelInboundHandler {
 
             switch op {
             case .ping:
-                logger.debug("ping")
+                logger.debug("Nats ---->ping")
                 Task {
                     do {
                         try await self.write(operation: .pong)
@@ -172,11 +172,11 @@ class ConnectionHandler: ChannelInboundHandler {
                     }
                 }
             case .pong:
-                logger.debug("pong")
+                logger.debug("Nats ---->pong")
                 self.outstandingPings.store(0, ordering: AtomicStoreOrdering.relaxed)
                 self.pingQueue.dequeue()?.setRoundTripTime()
             case .error(let err):
-                logger.debug("error \(err)")
+                logger.debug("Nats ---->error \(err)")
 
                 switch err {
                 case .staleConnection, .maxConnectionsExceeded:
@@ -190,14 +190,14 @@ class ConnectionHandler: ChannelInboundHandler {
             case .hMessage(let msg):
                 self.handleIncomingMessage(msg)
             case .info(let serverInfo):
-                logger.debug("info \(op)")
+                logger.debug("Nats ---->info \(op)")
                 self.serverInfo = serverInfo
                 if serverInfo.lameDuckMode {
                     self.fire(.lameDuckMode)
                 }
                 self.updateServersList(info: serverInfo)
             default:
-                logger.debug("unknown operation type: \(op)")
+                logger.debug("Nats ---->unknown operation type: \(op)")
             }
         }
         inputBuffer.clear()
@@ -266,11 +266,11 @@ class ConnectionHandler: ChannelInboundHandler {
                 if case .invalidConfig(_) = error {
                     throw error
                 }
-                logger.debug("Error connecting to server: \(error)")
+                logger.debug("Nats ---->Error connecting to server: \(error)")
                 lastErr = error
                 continue
             } catch {
-                logger.debug("Error connecting to server: \(error)")
+                logger.debug("Nats ---->Error connecting to server: \(error)")
                 lastErr = error
                 continue
             }
@@ -325,7 +325,7 @@ class ConnectionHandler: ChannelInboundHandler {
             Task { await self.sendPing() }
         }
         
-        logger.debug("Connection established successfully")
+        logger.debug("Nats ---->Connection established successfully")
     }
 
     /// **Change Explanation:**
@@ -403,7 +403,7 @@ class ConnectionHandler: ChannelInboundHandler {
             tlsConfiguration.privateKey = .privateKey(privateKey)
         }
         
-        logger.debug("TLS configuration prepared.")
+        logger.debug("Nats ---->TLS configuration prepared.")
         return tlsConfiguration
     }
 
@@ -412,44 +412,86 @@ class ConnectionHandler: ChannelInboundHandler {
     /// - Added validation checks for auth configurations.
     /// - Intention: Prevent misconfiguration during the initial connection handshake.
     private func sendClientConnectInit() async throws {
-        var initialConnect = ConnectInfo(
-            verbose: false, pedantic: false, userJwt: nil, nkey: "", name: "", echo: true,
-            lang: self.lang, version: self.version, natsProtocol: .dynamic, tlsRequired: false,
-            user: self.auth?.user ?? "", pass: self.auth?.password ?? "",
-            authToken: self.auth?.token ?? "", headers: true, noResponders: true
-        )
+    var initialConnect = ConnectInfo(
+        verbose: false,
+        pedantic: false,
+        userJwt: nil,
+        nkey: "",
+        name: "",
+        echo: true,
+        lang: self.lang,
+        version: self.version,
+        natsProtocol: .dynamic,
+        tlsRequired: false,
+        user: self.auth?.user ?? "",
+        pass: self.auth?.password ?? "",
+        authToken: self.auth?.token ?? "",
+        headers: true,
+        noResponders: true
+    )
+
+    // Prevent invalid configurations with both nkey and nkeyPath
+    if self.auth?.nkey != nil && self.auth?.nkeyPath != nil {
+        throw NatsError.ConnectError.invalidConfig("Cannot use both nkey and nkeyPath")
+    }
+
+    // Handle credentials file
+    if let auth = self.auth, let credentialsPath = auth.credentialsPath {
+        let credentials = try await URLSession.shared.data(from: credentialsPath).0
         
-        if self.auth?.nkey != nil && self.auth?.nkeyPath != nil {
-            throw NatsError.ConnectError.invalidConfig("Cannot use both nkey and nkeyPath")
+        guard let jwt = JwtUtils.parseDecoratedJWT(contents: credentials),
+              let nkey = JwtUtils.parseDecoratedNKey(contents: credentials),
+              let nonce = self.serverInfo?.nonce else {
+            throw NatsError.ConnectError.invalidConfig("Failed to extract JWT/NKEY or missing nonce")
         }
+
+        let keypair = try KeyPair(seed: String(data: nkey, encoding: .utf8)!)
+        let sig = try keypair.sign(input: nonce.data(using: .utf8)!)
+        initialConnect.signature = sig.base64EncodedURLSafeNotPadded()
+        initialConnect.userJwt = String(data: jwt, encoding: .utf8)!
+    }
+
+    // Handle inline nkeyPath
+    if let nkeyPath = self.auth?.nkeyPath {
+        let nkeyData = try await URLSession.shared.data(from: nkeyPath).0
         
-        if let auth = self.auth, let credentialsPath = auth.credentialsPath {
-            let credentials = try await URLSession.shared.data(from: credentialsPath).0
-            guard let jwt = JwtUtils.parseDecoratedJWT(contents: credentials),
-                  let nkey = JwtUtils.parseDecoratedNKey(contents: credentials),
-                  let nonce = self.serverInfo?.nonce else {
-                throw NatsError.ConnectError.invalidConfig("Failed to extract JWT/NKEY or missing nonce")
-            }
-            
-            let keypair = try KeyPair(seed: String(data: nkey, encoding: .utf8)!)
-            let sig = try keypair.sign(input: nonce.data(using: .utf8)!)
-            initialConnect.signature = sig.base64EncodedURLSafeNotPadded()
-            initialConnect.userJwt = String(data: jwt, encoding: .utf8)!
+        guard let nkeyContent = String(data: nkeyData, encoding: .utf8),
+              let nonce = self.serverInfo?.nonce else {
+            throw NatsError.ConnectError.invalidConfig("Failed to read NKEY file or missing nonce")
         }
-        
-        try await withCheckedThrowingContinuation { continuation in
-            self.connectionEstablishedContinuation = continuation
-            Task.detached {
-                do {
-                    try await self.write(operation: ClientOp.connect(initialConnect))
-                    try await self.write(operation: ClientOp.ping)
-                    self.channel?.flush()
-                } catch {
-                    continuation.resume(throwing: error)
-                }
+
+        let keypair = try KeyPair(seed: nkeyContent.trimmingCharacters(in: .whitespacesAndNewlines))
+        let sig = try keypair.sign(input: nonce.data(using: .utf8)!)
+        initialConnect.signature = sig.base64EncodedURLSafeNotPadded()
+        initialConnect.nkey = keypair.publicKeyEncoded
+    }
+
+    // Handle inline nkey
+    if let nkey = self.auth?.nkey {
+        guard let nonce = self.serverInfo?.nonce else {
+            throw NatsError.ConnectError.invalidConfig("Missing nonce for NKEY authentication")
+        }
+
+        let keypair = try KeyPair(seed: nkey)
+        let sig = try keypair.sign(input: nonce.data(using: .utf8)!)
+        initialConnect.signature = sig.base64EncodedURLSafeNotPadded()
+        initialConnect.nkey = keypair.publicKeyEncoded
+    }
+
+    // Ensure the connect and ping commands are sent correctly
+    try await withCheckedThrowingContinuation { continuation in
+        self.connectionEstablishedContinuation = continuation
+        Task {
+            do {
+                try await self.write(operation: ClientOp.connect(initialConnect))
+                try await self.write(operation: ClientOp.ping)
+                self.channel?.flush()
+            } catch {
+                continuation.resume(throwing: error)
             }
         }
     }
+}
 
     /// Initializes a connection to the specified server URL.
     /// Handles TLS, WebSocket, and standard connections with proper error handling.
@@ -464,7 +506,7 @@ class ConnectionHandler: ChannelInboundHandler {
                 value: 1
             )
             .channelInitializer { channel in
-                logger.debug("Initializing bootstrap connection to \(server)")
+                logger.debug("Nats ---->Initializing bootstrap connection to \(server)")
                 
                 if self.requireTls && self.tlsFirst {
                     // 📌 Handle TLS-First Configuration
@@ -490,7 +532,7 @@ class ConnectionHandler: ChannelInboundHandler {
         server: URL,
         upgradePromise: EventLoopPromise<Void>
     ) -> EventLoopFuture<Void> {
-        logger.debug("Setting up TLS connection...")
+        logger.debug("Nats ---->Setting up TLS connection...")
         
         do {
             let tlsConfig = try self.makeTLSConfig()
@@ -508,7 +550,7 @@ class ConnectionHandler: ChannelInboundHandler {
                 upgradePromise.fail(tlsError)
                 return channel.eventLoop.makeFailedFuture(tlsError)
             }.flatMap {
-                logger.debug("TLS connection established successfully.")
+                logger.debug("Nats ---->TLS connection established successfully.")
                 upgradePromise.succeed(())
                 return upgradePromise.futureResult
             }
@@ -527,7 +569,7 @@ class ConnectionHandler: ChannelInboundHandler {
         server: URL,
         upgradePromise: EventLoopPromise<Void>
     ) -> EventLoopFuture<Void> {
-        logger.debug("Setting up WebSocket connection...")
+        logger.debug("Nats ---->Setting up WebSocket connection...")
 
         let httpUpgradeRequestHandler = HTTPUpgradeRequestHandler(
             host: server.host ?? "localhost",
@@ -595,10 +637,10 @@ class ConnectionHandler: ChannelInboundHandler {
         channel: Channel,
         upgradePromise: EventLoopPromise<Void>
     ) -> EventLoopFuture<Void> {
-        logger.debug("Setting up standard TCP connection...")
+        logger.debug("Nats ---->Setting up standard TCP connection...")
         
         return channel.pipeline.addHandler(self).flatMap {
-            logger.debug("TCP connection established successfully.")
+            logger.debug("Nats ---->TCP connection established successfully.")
             upgradePromise.succeed(())
             return channel.eventLoop.makeSucceededFuture(())
         }.flatMapError { error in
@@ -623,7 +665,7 @@ class ConnectionHandler: ChannelInboundHandler {
                 urls.append(url)
             }
         }
-        logger.debug("Server list updated: \(self.urls.map { $0.absoluteString })")
+        logger.debug("Nats ---->Server list updated: \(self.urls.map { $0.absoluteString })")
     }
 
     // MARK: - Connection Lifecycle
@@ -653,11 +695,11 @@ class ConnectionHandler: ChannelInboundHandler {
             try await promise.futureResult.get()
         } catch ChannelError.alreadyClosed {
             // Avoid throwing errors for already closed channels
-            logger.debug("Channel already closed, no action needed.")
+            logger.debug("Nats ---->Channel already closed, no action needed.")
         }
 
         self.fire(.closed)
-        logger.debug("Connection closed successfully.")
+        logger.debug("Nats ---->Connection closed successfully.")
     }
 
     /// **Change Explanation:**
@@ -667,7 +709,7 @@ class ConnectionHandler: ChannelInboundHandler {
     private func disconnect() async throws {
         self.pingTask?.cancel()
         try await self.channel?.close().get()
-        logger.debug("Disconnected from server.")
+        logger.debug("Nats ---->Disconnected from server.")
     }
 
     /// **Change Explanation:**
@@ -697,7 +739,7 @@ class ConnectionHandler: ChannelInboundHandler {
 
         try await promise.futureResult.get()
         self.fire(.suspended)
-        logger.debug("Connection suspended successfully.")
+        logger.debug("Nats ---->Connection suspended successfully.")
     }
 
     /// **Change Explanation:**
@@ -716,7 +758,7 @@ class ConnectionHandler: ChannelInboundHandler {
             }
             self.handleReconnect()
         }.get()
-        logger.debug("Connection resumed successfully.")
+        logger.debug("Nats ---->Connection resumed successfully.")
     }
 
     /// **Change Explanation:**
@@ -726,7 +768,7 @@ class ConnectionHandler: ChannelInboundHandler {
     func reconnect() async throws {
         try await suspend()
         try await resume()
-        logger.debug("Reconnected successfully.")
+        logger.debug("Nats ---->Reconnected successfully.")
     }
 
     // MARK: - Ping Management
@@ -747,14 +789,14 @@ class ConnectionHandler: ChannelInboundHandler {
         do {
             self.pingQueue.enqueue(rttCommand ?? RttCommand.makeFrom(channel: self.channel))
             try await self.write(operation: ping)
-            logger.debug("Sent ping: \(pingsOut)")
+            logger.debug("Nats ---->Sent ping: \(pingsOut)")
         } catch {
             logger.error("Unable to send ping: \(error)")
         }
     }
 
     func channelActive(context: ChannelHandlerContext) {
-        logger.debug("TCP channel active")
+        logger.debug("Nats ---->TCP channel active")
 
         inputBuffer = context.channel.allocator.buffer(capacity: 1024 * 1024 * 8)
     }
@@ -766,7 +808,7 @@ class ConnectionHandler: ChannelInboundHandler {
     /// - Clarified the role of `handleDisconnect`.
     /// - Intention: Prevent connection inconsistencies on disconnection.
     func channelInactive(context: ChannelHandlerContext) {
-        logger.debug("TCP channel inactive")
+        logger.debug("Nats ---->TCP channel inactive")
         if self.state == .connected {
             handleDisconnect()
         }
@@ -777,7 +819,7 @@ class ConnectionHandler: ChannelInboundHandler {
     /// - Clear distinction between recoverable and unrecoverable errors.
     /// - Intention: Avoid unexpected terminations on recoverable errors.
     func errorCaught(context: ChannelHandlerContext, error: Error) {
-        logger.debug("Encountered error on the channel: \(error)")
+        logger.debug("Nats ---->Encountered error on the channel: \(error)")
         context.close(promise: nil)
         
         if let natsErr = error as? NatsErrorProtocol {
@@ -808,11 +850,11 @@ class ConnectionHandler: ChannelInboundHandler {
     /// Handles the disconnection logic for the client.
     /// Ensures proper cleanup, state management, and error handling.
     func handleDisconnect() {
-        logger.debug("Starting handleDisconnect process...")
+        logger.debug("Nats ---->Starting handleDisconnect process...")
         
         // Ensure state changes only if the channel is valid
         guard let channel = self.channel else {
-            logger.debug("handleDisconnect called but no active channel exists.")
+            logger.debug("Nats ---->handleDisconnect called but no active channel exists.")
             self.state = .disconnected
             handleReconnect()
             return
@@ -823,16 +865,16 @@ class ConnectionHandler: ChannelInboundHandler {
         
         Task {
             do {
-                logger.debug("Attempting to disconnect...")
+                logger.debug("Nats ---->Attempting to disconnect...")
                 try await self.disconnect()
                 promise.succeed()
             } catch ChannelError.alreadyClosed {
                 // Channel already closed; resolve promise gracefully
-                logger.debug("Channel was already closed during disconnect.")
+                logger.debug("Nats ---->Channel was already closed during disconnect.")
                 promise.succeed()
             } catch is CancellationError {
                 // Handle task cancellation explicitly
-                logger.debug("Disconnect task was cancelled.")
+                logger.debug("Nats ---->Disconnect task was cancelled.")
                 promise.fail(CancellationError())
             } catch {
                 // Handle any other unexpected errors
@@ -873,10 +915,10 @@ class ConnectionHandler: ChannelInboundHandler {
                 } catch _ as CancellationError {
                     return
                 } catch {
-                    logger.debug("Reconnect attempt failed: \(error)")
+                    logger.debug("Nats ---->Reconnect attempt failed: \(error)")
                     continue
                 }
-                logger.debug("Reconnected successfully")
+                logger.debug("Nats ---->Reconnected successfully")
                 reconnected = true
                 break
             }
@@ -921,7 +963,7 @@ class ConnectionHandler: ChannelInboundHandler {
         }
         do {
             try await buffer.writeMessage(operation)
-            logger.debug("Operation written successfully: \(operation)")
+            logger.debug("Nats ---->Operation written successfully: \(operation)")
         } catch {
             logger.error("Failed to write operation: \(error)")
             throw NatsError.ClientError.io(error)
@@ -943,7 +985,7 @@ class ConnectionHandler: ChannelInboundHandler {
         let sub = try NatsSubscription(sid: sid, subject: subject, queue: queue, conn: self)
         try await write(operation: ClientOp.subscribe((sid, subject, queue)))
         self.subscriptions[sid] = sub
-        logger.debug("Subscribed to subject: \(subject) with sid: \(sid)")
+        logger.debug("Nats ---->Subscribed to subject: \(subject) with sid: \(sid)")
         return sub
     }
 
@@ -955,11 +997,11 @@ class ConnectionHandler: ChannelInboundHandler {
         if let max, sub.delivered < max {
             try await write(operation: ClientOp.unsubscribe((sid: sub.sid, max: max)))
             sub.max = max
-            logger.debug("Unsubscribed with max messages limit: \(max)")
+            logger.debug("Nats ---->Unsubscribed with max messages limit: \(max)")
         } else {
             try await write(operation: ClientOp.unsubscribe((sid: sub.sid, max: nil)))
             self.removeSub(sub: sub)
-            logger.debug("Unsubscribed from subject: \(sub.subject)")
+            logger.debug("Nats ---->Unsubscribed from subject: \(sub.subject)")
         }
     }
 
@@ -970,7 +1012,7 @@ class ConnectionHandler: ChannelInboundHandler {
     internal func removeSub(sub: NatsSubscription) {
         self.subscriptions.removeValue(forKey: sub.sid)
         sub.complete()
-        logger.debug("Subscription removed: \(sub.subject) with sid: \(sub.sid)")
+        logger.debug("Nats ---->Subscription removed: \(sub.subject) with sid: \(sub.sid)")
     }
 }
 
@@ -985,14 +1027,14 @@ extension ConnectionHandler {
     internal func fire(_ event: NatsEvent) {
         let eventKind = event.kind()
         guard let handlerStore = self.eventHandlerStore[eventKind] else {
-            logger.debug("No handlers for event: \(eventKind.rawValue)")
+            logger.debug("Nats ---->No handlers for event: \(eventKind.rawValue)")
             return
         }
         
         for handler in handlerStore {
             handler.handler(event)
         }
-        logger.debug("Event fired: \(eventKind.rawValue)")
+        logger.debug("Nats ---->Event fired: \(eventKind.rawValue)")
     }
     
     /// **Change Explanation:**
@@ -1013,7 +1055,7 @@ extension ConnectionHandler {
             )
         }
         
-        logger.debug("Listener added with ID: \(id) for events: \(events.map { $0.rawValue })")
+        logger.debug("Nats ---->Listener added with ID: \(id) for events: \(events.map { $0.rawValue })")
         return id
     }
     
@@ -1025,7 +1067,7 @@ extension ConnectionHandler {
         for event in NatsEventKind.all {
             self.eventHandlerStore[event] = self.eventHandlerStore[event]?.filter { $0.listenerId != id }
         }
-        logger.debug("Listener removed with ID: \(id)")
+        logger.debug("Nats ---->Listener removed with ID: \(id)")
     }
     
 }
