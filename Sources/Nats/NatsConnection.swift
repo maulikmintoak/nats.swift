@@ -281,11 +281,16 @@ class ConnectionHandler: ChannelInboundHandler {
         
         if let lastErr {
             self.state = .disconnected
-            
             switch lastErr {
             case let error as ChannelError:
                 self.serverInfoContinuation = nil
-                let err: NatsError.ConnectError = (error == .connectTimeout) ? .timeout : .io(error)
+                let err: NatsError.ConnectError
+                switch error {
+                case .connectTimeout(_):
+                    err = .timeout
+                default:
+                    err = .io(error)
+                }
                 throw err
             case let error as NIOConnectionError:
                 if let dnsAAAAError = error.dnsAAAAError {
@@ -496,18 +501,21 @@ class ConnectionHandler: ChannelInboundHandler {
             
             return channel.pipeline.addHandler(sslHandler).flatMap {
                 channel.pipeline.addHandler(self)
-            }.whenComplete { result in
-                switch result {
-                case .success:
-                    logger.debug("TLS connection established successfully.")
-                    upgradePromise.succeed(())
-                case .failure(let error):
-                    logger.error("TLS connection failed: \(error)")
-                    upgradePromise.fail(error)
-                }
+            }.flatMapError { error in
+                // Handle error gracefully
+                logger.error("TLS connection failed: \(error)")
+                let tlsError = NatsError.ConnectError.tlsFailure(error)
+                upgradePromise.fail(tlsError)
+                return channel.eventLoop.makeFailedFuture(tlsError)
+            }.flatMap {
+                logger.debug("TLS connection established successfully.")
+                upgradePromise.succeed(())
+                return upgradePromise.futureResult
             }
         } catch {
+            // Handle synchronous errors in the try block
             let tlsError = NatsError.ConnectError.tlsFailure(error)
+            logger.error("Synchronous TLS configuration error: \(error)")
             upgradePromise.fail(tlsError)
             return channel.eventLoop.makeFailedFuture(tlsError)
         }
@@ -536,7 +544,14 @@ class ConnectionHandler: ChannelInboundHandler {
             maxFrameSize: 8 * 1024 * 1024,
             automaticErrorHandling: true,
             upgradePipelineHandler: { channel, _ in
-                channel.pipeline.addHandler(NIOWebSocketFrameAggregator()).flatMap {
+                // Add NIOWebSocketFrameAggregator with appropriate parameters
+                let frameAggregator = NIOWebSocketFrameAggregator(
+                    minNonFinalFragmentSize: 512,       // Minimum fragment size
+                    maxAccumulatedFrameCount: 10,      // Maximum fragment count
+                    maxAccumulatedFrameSize: 8 * 1024 * 1024 // Maximum accumulated frame size (8MB)
+                )
+                
+                return channel.pipeline.addHandler(frameAggregator).flatMap {
                     channel.pipeline.addHandler(WebSocketByteBufferCodec()).flatMap {
                         channel.pipeline.addHandler(self)
                     }
@@ -581,15 +596,15 @@ class ConnectionHandler: ChannelInboundHandler {
         upgradePromise: EventLoopPromise<Void>
     ) -> EventLoopFuture<Void> {
         logger.debug("Setting up standard TCP connection...")
-        return channel.pipeline.addHandler(self).whenComplete { result in
-            switch result {
-            case .success:
-                logger.debug("TCP connection established successfully.")
-                upgradePromise.succeed(())
-            case .failure(let error):
-                logger.error("TCP connection failed: \(error)")
-                upgradePromise.fail(error)
-            }
+        
+        return channel.pipeline.addHandler(self).flatMap {
+            logger.debug("TCP connection established successfully.")
+            upgradePromise.succeed(())
+            return channel.eventLoop.makeSucceededFuture(())
+        }.flatMapError { error in
+            logger.error("TCP connection failed: \(error)")
+            upgradePromise.fail(error)
+            return channel.eventLoop.makeFailedFuture(error)
         }
     }
 
@@ -797,7 +812,7 @@ class ConnectionHandler: ChannelInboundHandler {
         
         // Ensure state changes only if the channel is valid
         guard let channel = self.channel else {
-            logger.warn("handleDisconnect called but no active channel exists.")
+            logger.debug("handleDisconnect called but no active channel exists.")
             self.state = .disconnected
             handleReconnect()
             return
@@ -813,11 +828,11 @@ class ConnectionHandler: ChannelInboundHandler {
                 promise.succeed()
             } catch ChannelError.alreadyClosed {
                 // Channel already closed; resolve promise gracefully
-                logger.warn("Channel was already closed during disconnect.")
+                logger.debug("Channel was already closed during disconnect.")
                 promise.succeed()
-            } catch CancellationError {
+            } catch is CancellationError {
                 // Handle task cancellation explicitly
-                logger.warn("Disconnect task was cancelled.")
+                logger.debug("Disconnect task was cancelled.")
                 promise.fail(CancellationError())
             } catch {
                 // Handle any other unexpected errors
