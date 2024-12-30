@@ -63,7 +63,6 @@ class ConnectionHandler: ChannelInboundHandler {
     
     private var serverInfoContinuation: CheckedContinuation<ServerInfo, Error>?
     private var connectionEstablishedContinuation: CheckedContinuation<Void, Error>?
-    private var reconnectTask: Task<(), Never>? = nil
     private var isAppInBackground = false
     private var pingTaskPaused = false
     
