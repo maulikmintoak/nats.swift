@@ -23,14 +23,14 @@ import NKeys
 class ConnectionHandler: ChannelInboundHandler {
     let lang = "Swift"
     let version = "0.0.1"
-
+    
     internal var connectedUrl: URL?
     internal let allocator = ByteBufferAllocator()
     internal var inputBuffer: ByteBuffer
     internal var channel: Channel?
-
+    
     private var eventHandlerStore: [NatsEventKind: [NatsEventHandler]] = [:]
-
+    
     // Connection options
     internal var retryOnFailedConnect = false
     private var urls: [URL]
@@ -43,11 +43,11 @@ class ConnectionHandler: ChannelInboundHandler {
     private var rootCertificate: URL?
     private var clientCertificate: URL?
     private var clientKey: URL?
-
+    
     typealias InboundIn = ByteBuffer
     private let stateLock = NSLock()
     internal var state: NatsState = .pending
-
+    
     private var subscriptions: [UInt64: NatsSubscription]
     private var subscriptionCounter = ManagedAtomic<UInt64>(0)
     private var serverInfo: ServerInfo?
@@ -57,17 +57,17 @@ class ConnectionHandler: ChannelInboundHandler {
     private var outstandingPings = ManagedAtomic<UInt8>(0)
     private var reconnectAttempts = 0
     private var reconnectTask: Task<(), Never>? = nil
-
+    
     private var group: MultiThreadedEventLoopGroup
-
+    
     private var serverInfoContinuation: CheckedContinuation<ServerInfo, Error>?
     private var connectionEstablishedContinuation: CheckedContinuation<Void, Error>?
-
+    
     private let pingQueue = ConcurrentQueue<RttCommand>()
     private(set) var batchBuffer: BatchBuffer?
-
+    
     // MARK: - Initialization
-
+    
     /// **Change Explanation:**
     /// - Ensured all initialization variables have a clear and consistent setup.
     /// - Fixed redundant `inputBuffer` initialization.
@@ -94,7 +94,7 @@ class ConnectionHandler: ChannelInboundHandler {
         self.clientKey = clientKey
         self.rootCertificate = rootCertificate
         self.retryOnFailedConnect = retryOnFailedConnect
-
+        
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(appDidEnterBackground),
@@ -110,53 +110,50 @@ class ConnectionHandler: ChannelInboundHandler {
         )
         
     }
-deinit {
+    deinit {
         NotificationCenter.default.removeObserver(self)
     }
-
+    
     @objc private func appDidEnterBackground() {
-    logger.warn("App entered background. Pausing operations...")
-    self.isAppInBackground = true
-    Task {
-        await pauseBackgroundOperations()
-    }
-}
-
-@objc private func appWillEnterForeground() {
-    logger.warn("App entered foreground. Resuming operations...")
-    self.isAppInBackground = false
-    Task {
-        await resumeForegroundOperations()
-    }
-}
-    /// Pause tasks and avoid triggering continuations while in background
-private func pauseBackgroundOperations() async {
-    self.pingTaskPaused = true
-    self.pingTask?.cancel()
-    self.pingTask = nil
-    
-    logger.debug("Ping tasks paused to preserve background connection.")
-}
-
-/// Resume normal tasks when app returns to foreground
-private func resumeForegroundOperations() async {
-    guard !self.pingTaskPaused else { return }
-    
-    let pingInterval = TimeAmount.nanoseconds(Int64(self.pingInterval * 1_000_000_000))
-    self.pingTask = self.channel?.eventLoop.scheduleRepeatedTask(
-        initialDelay: pingInterval, delay: pingInterval
-    ) { _ in
-        Task { await self.sendPing() }
+        logger.debug("NATS -----> App entered background. Pausing operations...")
+        self.isAppInBackground = true
+        Task {
+            await pauseBackgroundOperations()
+        }
     }
     
-    self.pingTaskPaused = false
-    logger.debug("Ping tasks resumed after returning to foreground.")
-}
-
+    @objc private func appWillEnterForeground() {
+        logger.debug("NATS -----> App entered foreground. Resuming operations...")
+        self.isAppInBackground = false
+        Task {
+            await resumeForegroundOperations()
+        }
+    }
+    
+    private func pauseBackgroundOperations() async {
+        self.pingTask?.cancel()
+        self.pingTask = nil
+        logger.debug("Background operations paused.")
+    }
+    
+    private func resumeForegroundOperations() async {
+        guard !self.isAppInBackground else {
+            logger.debug("NATS -----> App still in background. Skipping resume.")
+            return
+        }
+        
+        let pingInterval = TimeAmount.nanoseconds(Int64(self.pingInterval * 1_000_000_000))
+        self.pingTask = self.channel?.eventLoop.scheduleRepeatedTask(
+            initialDelay: pingInterval, delay: pingInterval
+        ) { _ in
+            Task { await self.sendPing() }
+        }
+        logger.debug("NATS -----> Background operations resumed.")
+    }
     
     
     // MARK: - Channel Handlers
-
+    
     /// **Change Explanation:**
     /// - Added error handling to ensure buffer integrity on failed reads.
     /// - Intention: Prevent partial reads from corrupting the buffer state.
@@ -164,128 +161,128 @@ private func resumeForegroundOperations() async {
         var byteBuffer = self.unwrapInboundIn(data)
         inputBuffer.writeBuffer(&byteBuffer)
     }
-
+    
     /// **Change Explanation:**
     /// - Added error handling for malformed messages.
     /// - Introduced additional logging for clarity.
     /// - Intention: Ensure robust message parsing and clearer debugging.
     func channelReadComplete(context: ChannelHandlerContext) {
-    logger.debug("Nats ---->channelReadComplete invoked")
-
-    // Safely extract input chunk
-    var inputChunk = Data(buffer: inputBuffer)
-    if let remainder = self.parseRemainder {
-        inputChunk.prepend(remainder)
-    }
-    self.parseRemainder = nil
-
-    let parseResult: (ops: [ServerOp], remainder: Data?)
-    do {
-        parseResult = try inputChunk.parseOutMessages()
-    } catch {
-        inputBuffer.clear()
-        context.fireErrorCaught(error)
-        logger.debug("Nats ---->Failed to parse messages: \(error)")
-        return
-    }
-
-    if let remainder = parseResult.remainder {
-        self.parseRemainder = remainder
-    }
-
-    for op in parseResult.ops {
-        // Handle server info continuation safely
-        if let continuation = self.serverInfoContinuation {
-            self.serverInfoContinuation = nil
-            logger.debug("Nats ---->Handling server info continuation")
-            switch op {
-            case .error(let err):
-                logger.debug("Nats ---->Server Info Continuation Error: \(err)")
-                continuation.resume(throwing: err)
-            case .info(let info):
-                logger.debug("Nats ---->Server Info Continuation Success")
-                continuation.resume(returning: info)
-            default:
-                logger.debug("Nats ---->Unexpected op for server info continuation: \(op)")
-            }
-            continue
+        logger.debug("Nats ---->channelReadComplete invoked")
+        
+        // Safely extract input chunk
+        var inputChunk = Data(buffer: inputBuffer)
+        if let remainder = self.parseRemainder {
+            inputChunk.prepend(remainder)
         }
-
-        // Handle connection established continuation safely
-        if let continuation = self.connectionEstablishedContinuation {
-            self.connectionEstablishedContinuation = nil
-            logger.debug("Nats ---->Handling connection established continuation")
-            switch op {
-            case .error(let err):
-                logger.debug("Nats ---->Connection Established Continuation Error: \(err)")
-                continuation.resume(throwing: err)
-            default:
-                logger.debug("Nats ---->Connection Established Continuation Success")
-                continuation.resume()
-            }
-            continue
+        self.parseRemainder = nil
+        
+        let parseResult: (ops: [ServerOp], remainder: Data?)
+        do {
+            parseResult = try inputChunk.parseOutMessages()
+        } catch {
+            inputBuffer.clear()
+            context.fireErrorCaught(error)
+            logger.debug("Nats ---->Failed to parse messages: \(error)")
+            return
         }
-
-        // Handle other server operations
-        switch op {
-        case .ping:
-            logger.debug("Nats ---->Received PING")
-            Task {
-                do {
-                    try await self.write(operation: .pong)
-                    logger.debug("Nats ---->Sent PONG successfully")
-                } catch let err as NatsError.ClientError {
-                    logger.debug("Nats ---->Error sending PONG: \(err)")
-                    self.fire(.error(err))
-                } catch {
-                    logger.debug("Nats ---->Unexpected error sending PONG: \(error)")
+        
+        if let remainder = parseResult.remainder {
+            self.parseRemainder = remainder
+        }
+        
+        for op in parseResult.ops {
+            // Handle server info continuation safely
+            if let continuation = self.serverInfoContinuation {
+                self.serverInfoContinuation = nil
+                logger.debug("Nats ---->Handling server info continuation")
+                switch op {
+                case .error(let err):
+                    logger.debug("Nats ---->Server Info Continuation Error: \(err)")
+                    continuation.resume(throwing: err)
+                case .info(let info):
+                    logger.debug("Nats ---->Server Info Continuation Success")
+                    continuation.resume(returning: info)
+                default:
+                    logger.debug("Nats ---->Unexpected op for server info continuation: \(op)")
                 }
+                continue
             }
-
-        case .pong:
-            logger.debug("Nats ---->Received PONG")
-            self.outstandingPings.store(0, ordering: .relaxed)
-            self.pingQueue.dequeue()?.setRoundTripTime()
-
-        case .error(let err):
-            logger.debug("Nats ---->Received error: \(err)")
-            switch err {
-            case .staleConnection, .maxConnectionsExceeded:
-                logger.debug("Nats ---->Stale connection or max connections exceeded.")
-                inputBuffer.clear()
-                context.fireErrorCaught(err)
+            
+            // Handle connection established continuation safely
+            if let continuation = self.connectionEstablishedContinuation {
+                self.connectionEstablishedContinuation = nil
+                logger.debug("Nats ---->Handling connection established continuation")
+                switch op {
+                case .error(let err):
+                    logger.debug("Nats ---->Connection Established Continuation Error: \(err)")
+                    continuation.resume(throwing: err)
+                default:
+                    logger.debug("Nats ---->Connection Established Continuation Success")
+                    continuation.resume()
+                }
+                continue
+            }
+            
+            // Handle other server operations
+            switch op {
+            case .ping:
+                logger.debug("Nats ---->Received PING")
+                Task {
+                    do {
+                        try await self.write(operation: .pong)
+                        logger.debug("Nats ---->Sent PONG successfully")
+                    } catch let err as NatsError.ClientError {
+                        logger.debug("Nats ---->Error sending PONG: \(err)")
+                        self.fire(.error(err))
+                    } catch {
+                        logger.debug("Nats ---->Unexpected error sending PONG: \(error)")
+                    }
+                }
+                
+            case .pong:
+                logger.debug("Nats ---->Received PONG")
+                self.outstandingPings.store(0, ordering: .relaxed)
+                self.pingQueue.dequeue()?.setRoundTripTime()
+                
+            case .error(let err):
+                logger.debug("Nats ---->Received error: \(err)")
+                switch err {
+                case .staleConnection, .maxConnectionsExceeded:
+                    logger.debug("Nats ---->Stale connection or max connections exceeded.")
+                    inputBuffer.clear()
+                    context.fireErrorCaught(err)
+                default:
+                    logger.debug("Nats ---->Firing error event")
+                    self.fire(.error(err))
+                }
+                
+            case .message(let msg):
+                logger.debug("Nats ---->Received MESSAGE")
+                self.handleIncomingMessage(msg)
+                
+            case .hMessage(let msg):
+                logger.debug("Nats ---->Received HMessage")
+                self.handleIncomingMessage(msg)
+                
+            case .info(let serverInfo):
+                logger.debug("Nats ---->Received INFO: \(serverInfo)")
+                self.serverInfo = serverInfo
+                if serverInfo.lameDuckMode {
+                    logger.debug("Nats ---->Server in Lame Duck Mode")
+                    self.fire(.lameDuckMode)
+                }
+                self.updateServersList(info: serverInfo)
+                
             default:
-                logger.debug("Nats ---->Firing error event")
-                self.fire(.error(err))
+                logger.debug("Nats ---->Unknown operation type received: \(op)")
             }
-
-        case .message(let msg):
-            logger.debug("Nats ---->Received MESSAGE")
-            self.handleIncomingMessage(msg)
-
-        case .hMessage(let msg):
-            logger.debug("Nats ---->Received HMessage")
-            self.handleIncomingMessage(msg)
-
-        case .info(let serverInfo):
-            logger.debug("Nats ---->Received INFO: \(serverInfo)")
-            self.serverInfo = serverInfo
-            if serverInfo.lameDuckMode {
-                logger.debug("Nats ---->Server in Lame Duck Mode")
-                self.fire(.lameDuckMode)
-            }
-            self.updateServersList(info: serverInfo)
-
-        default:
-            logger.debug("Nats ---->Unknown operation type received: \(op)")
         }
+        
+        // Clear input buffer after processing
+        inputBuffer.clear()
+        logger.debug("Nats ---->Finished processing channelReadComplete")
     }
-
-    // Clear input buffer after processing
-    inputBuffer.clear()
-    logger.debug("Nats ---->Finished processing channelReadComplete")
-}
-
+    
     /// **Change Explanation:**
     /// - Refactored error handling.
     /// - Intention: Ensured cleaner handling of incoming `MessageInbound`.
@@ -298,7 +295,7 @@ private func resumeForegroundOperations() async {
             sub.receiveMessage(natsMsg)
         }
     }
-
+    
     /// **Change Explanation:**
     /// - Consolidated error handling for `HMessageInbound`.
     /// - Intention: Ensure consistency in message handling.
@@ -312,14 +309,14 @@ private func resumeForegroundOperations() async {
             sub.receiveMessage(natsMsg)
         }
     }
-
+    
     // MARK: - Connection Management
-
+    
     /// **Change Explanation:**
     /// - Refactored `connect` method to improve retry logic and handle errors more cleanly.
     /// - Added comments to explain each decision point.
     /// - Intention: Make the connection process more reliable and readable.
-
+    
     func connect() async throws {
         var servers = self.urls
         
@@ -410,74 +407,74 @@ private func resumeForegroundOperations() async {
         
         logger.debug("Nats ---->Connection established successfully")
     }
-
+    
     /// **Change Explanation:**
     /// - Refactored `connectToServer` to add better error handling and cleaner pipeline logic.
     /// - Added detailed comments for TLS and WebSocket handling.
     /// - Intention: Clear separation of connection responsibilities and improved reliability.
     /// Establishes a connection to a NATS server.
-/// Handles server connection lifecycle, TLS configuration, and initial client handshake.
-private func connectToServer(s: URL) async throws {
-    var infoTask: Task<(), Never>? = nil
-
-    // Safely capture server information using continuation
-    let info = try await withCheckedThrowingContinuation { continuation in
-        self.serverInfoContinuation = continuation
-        infoTask = Task {
-            do {
-                // Step 1: Bootstrap connection and validate server URL
-                let (bootstrap, upgradePromise) = self.bootstrapConnection(to: s)
-                guard let host = s.host, let port = s.port else {
-                    upgradePromise.succeed() // Ensure the upgradePromise is completed
-                    throw NatsError.ConnectError.invalidConfig("No valid host or port provided")
-                }
-                
-                // Step 2: Attempt connection
-                let connect = bootstrap.connect(host: host, port: port)
-                connect.cascadeFailure(to: upgradePromise)
-                self.channel = try await connect.get()
-                
-                // Step 3: Validate channel
-                guard let channel = self.channel else {
-                    upgradePromise.succeed() // Ensure promise is completed
-                    throw NatsError.ClientError.internalError("Failed to establish channel connection")
-                }
-                
-                // Step 4: Ensure connection upgrade completes successfully
-                try await upgradePromise.futureResult.get()
-                
-                // Step 5: Initialize Batch Buffer
-                self.batchBuffer = BatchBuffer(channel: channel)
-            } catch {
-                // Clean up continuation if an error occurs
-                if let continuation = self.serverInfoContinuation {
-                    self.serverInfoContinuation = nil
-                    continuation.resume(throwing: error)
+    /// Handles server connection lifecycle, TLS configuration, and initial client handshake.
+    private func connectToServer(s: URL) async throws {
+        var infoTask: Task<(), Never>? = nil
+        
+        // Safely capture server information using continuation
+        let info = try await withCheckedThrowingContinuation { continuation in
+            self.serverInfoContinuation = continuation
+            infoTask = Task {
+                do {
+                    // Step 1: Bootstrap connection and validate server URL
+                    let (bootstrap, upgradePromise) = self.bootstrapConnection(to: s)
+                    guard let host = s.host, let port = s.port else {
+                        upgradePromise.fail(NatsError.ConnectError.invalidConfig("No valid host or port provided"))
+                        throw NatsError.ConnectError.invalidConfig("No valid host or port provided")
+                    }
+                    
+                    // Step 2: Attempt connection
+                    let connect = bootstrap.connect(host: host, port: port)
+                    connect.cascadeFailure(to: upgradePromise)
+                    self.channel = try await connect.get()
+                    
+                    // Step 3: Validate channel
+                    guard let channel = self.channel else {
+                        upgradePromise.fail(NatsError.ClientError.internalError("Failed to establish channel connection"))
+                        throw NatsError.ClientError.internalError("Failed to establish channel connection")
+                    }
+                    
+                    // Step 4: Ensure connection upgrade completes successfully
+                    try await upgradePromise.futureResult.get()
+                    
+                    // Step 5: Initialize Batch Buffer
+                    self.batchBuffer = BatchBuffer(channel: channel)
+                } catch {
+                    // Clean up continuation safely
+                    if let continuation = self.serverInfoContinuation {
+                        self.serverInfoContinuation = nil
+                        continuation.resume(throwing: error)
+                    }
                 }
             }
         }
+        
+        // Ensure infoTask completes execution
+        await infoTask?.value
+        
+        // Step 6: Validate and apply TLS configuration if required
+        self.serverInfo = info
+        if (info.tlsRequired ?? false || self.requireTls) && !self.tlsFirst && s.scheme != "wss" {
+            let tlsConfig = try makeTLSConfig()
+            let sslContext = try NIOSSLContext(configuration: tlsConfig)
+            let sslHandler = try NIOSSLClientHandler(context: sslContext, serverHostname: s.host)
+            try await self.channel?.pipeline.addHandler(sslHandler, position: .first)
+        }
+        
+        // Step 7: Perform client handshake
+        try await sendClientConnectInit()
+        self.connectedUrl = s
+        
+        // Log successful connection
+        logger.debug("Successfully connected to NATS server at \(s)")
     }
-
-    // Ensure infoTask completes execution
-    await infoTask?.value
-
-    // Step 6: Validate and apply TLS configuration if required
-    self.serverInfo = info
-    if (info.tlsRequired ?? false || self.requireTls) && !self.tlsFirst && s.scheme != "wss" {
-        let tlsConfig = try makeTLSConfig()
-        let sslContext = try NIOSSLContext(configuration: tlsConfig)
-        let sslHandler = try NIOSSLClientHandler(context: sslContext, serverHostname: s.host)
-        try await self.channel?.pipeline.addHandler(sslHandler, position: .first)
-    }
-
-    // Step 7: Perform client handshake
-    try await sendClientConnectInit()
-    self.connectedUrl = s
     
-    // Log successful connection
-    logger.debug("Successfully connected to NATS server at \(s)")
-}
-
     /// **Change Explanation:**
     /// - Improved TLS configuration for better security defaults.
     /// - Added error handling for missing certificate/key files.
@@ -504,93 +501,93 @@ private func connectToServer(s: URL) async throws {
         logger.debug("Nats ---->TLS configuration prepared.")
         return tlsConfiguration
     }
-
+    
     /// **Change Explanation:**
     /// - Enhanced initial connection payload construction.
     /// - Added validation checks for auth configurations.
     /// - Intention: Prevent misconfiguration during the initial connection handshake.
     private func sendClientConnectInit() async throws {
-    var initialConnect = ConnectInfo(
-        verbose: false,
-        pedantic: false,
-        userJwt: nil,
-        nkey: "",
-        name: "",
-        echo: true,
-        lang: self.lang,
-        version: self.version,
-        natsProtocol: .dynamic,
-        tlsRequired: false,
-        user: self.auth?.user ?? "",
-        pass: self.auth?.password ?? "",
-        authToken: self.auth?.token ?? "",
-        headers: true,
-        noResponders: true
-    )
-
-    // Prevent invalid configurations with both nkey and nkeyPath
-    if self.auth?.nkey != nil && self.auth?.nkeyPath != nil {
-        throw NatsError.ConnectError.invalidConfig("Cannot use both nkey and nkeyPath")
-    }
-
-    // Handle credentials file
-    if let auth = self.auth, let credentialsPath = auth.credentialsPath {
-        let credentials = try await URLSession.shared.data(from: credentialsPath).0
+        var initialConnect = ConnectInfo(
+            verbose: false,
+            pedantic: false,
+            userJwt: nil,
+            nkey: "",
+            name: "",
+            echo: true,
+            lang: self.lang,
+            version: self.version,
+            natsProtocol: .dynamic,
+            tlsRequired: false,
+            user: self.auth?.user ?? "",
+            pass: self.auth?.password ?? "",
+            authToken: self.auth?.token ?? "",
+            headers: true,
+            noResponders: true
+        )
         
-        guard let jwt = JwtUtils.parseDecoratedJWT(contents: credentials),
-              let nkey = JwtUtils.parseDecoratedNKey(contents: credentials),
-              let nonce = self.serverInfo?.nonce else {
-            throw NatsError.ConnectError.invalidConfig("Failed to extract JWT/NKEY or missing nonce")
+        // Prevent invalid configurations with both nkey and nkeyPath
+        if self.auth?.nkey != nil && self.auth?.nkeyPath != nil {
+            throw NatsError.ConnectError.invalidConfig("Cannot use both nkey and nkeyPath")
         }
-
-        let keypair = try KeyPair(seed: String(data: nkey, encoding: .utf8)!)
-        let sig = try keypair.sign(input: nonce.data(using: .utf8)!)
-        initialConnect.signature = sig.base64EncodedURLSafeNotPadded()
-        initialConnect.userJwt = String(data: jwt, encoding: .utf8)!
-    }
-
-    // Handle inline nkeyPath
-    if let nkeyPath = self.auth?.nkeyPath {
-        let nkeyData = try await URLSession.shared.data(from: nkeyPath).0
         
-        guard let nkeyContent = String(data: nkeyData, encoding: .utf8),
-              let nonce = self.serverInfo?.nonce else {
-            throw NatsError.ConnectError.invalidConfig("Failed to read NKEY file or missing nonce")
+        // Handle credentials file
+        if let auth = self.auth, let credentialsPath = auth.credentialsPath {
+            let credentials = try await URLSession.shared.data(from: credentialsPath).0
+            
+            guard let jwt = JwtUtils.parseDecoratedJWT(contents: credentials),
+                  let nkey = JwtUtils.parseDecoratedNKey(contents: credentials),
+                  let nonce = self.serverInfo?.nonce else {
+                throw NatsError.ConnectError.invalidConfig("Failed to extract JWT/NKEY or missing nonce")
+            }
+            
+            let keypair = try KeyPair(seed: String(data: nkey, encoding: .utf8)!)
+            let sig = try keypair.sign(input: nonce.data(using: .utf8)!)
+            initialConnect.signature = sig.base64EncodedURLSafeNotPadded()
+            initialConnect.userJwt = String(data: jwt, encoding: .utf8)!
         }
-
-        let keypair = try KeyPair(seed: nkeyContent.trimmingCharacters(in: .whitespacesAndNewlines))
-        let sig = try keypair.sign(input: nonce.data(using: .utf8)!)
-        initialConnect.signature = sig.base64EncodedURLSafeNotPadded()
-        initialConnect.nkey = keypair.publicKeyEncoded
-    }
-
-    // Handle inline nkey
-    if let nkey = self.auth?.nkey {
-        guard let nonce = self.serverInfo?.nonce else {
-            throw NatsError.ConnectError.invalidConfig("Missing nonce for NKEY authentication")
+        
+        // Handle inline nkeyPath
+        if let nkeyPath = self.auth?.nkeyPath {
+            let nkeyData = try await URLSession.shared.data(from: nkeyPath).0
+            
+            guard let nkeyContent = String(data: nkeyData, encoding: .utf8),
+                  let nonce = self.serverInfo?.nonce else {
+                throw NatsError.ConnectError.invalidConfig("Failed to read NKEY file or missing nonce")
+            }
+            
+            let keypair = try KeyPair(seed: nkeyContent.trimmingCharacters(in: .whitespacesAndNewlines))
+            let sig = try keypair.sign(input: nonce.data(using: .utf8)!)
+            initialConnect.signature = sig.base64EncodedURLSafeNotPadded()
+            initialConnect.nkey = keypair.publicKeyEncoded
         }
-
-        let keypair = try KeyPair(seed: nkey)
-        let sig = try keypair.sign(input: nonce.data(using: .utf8)!)
-        initialConnect.signature = sig.base64EncodedURLSafeNotPadded()
-        initialConnect.nkey = keypair.publicKeyEncoded
-    }
-
-    // Ensure the connect and ping commands are sent correctly
-    try await withCheckedThrowingContinuation { continuation in
-        self.connectionEstablishedContinuation = continuation
-        Task {
-            do {
-                try await self.write(operation: ClientOp.connect(initialConnect))
-                try await self.write(operation: ClientOp.ping)
-                self.channel?.flush()
-            } catch {
-                continuation.resume(throwing: error)
+        
+        // Handle inline nkey
+        if let nkey = self.auth?.nkey {
+            guard let nonce = self.serverInfo?.nonce else {
+                throw NatsError.ConnectError.invalidConfig("Missing nonce for NKEY authentication")
+            }
+            
+            let keypair = try KeyPair(seed: nkey)
+            let sig = try keypair.sign(input: nonce.data(using: .utf8)!)
+            initialConnect.signature = sig.base64EncodedURLSafeNotPadded()
+            initialConnect.nkey = keypair.publicKeyEncoded
+        }
+        
+        // Ensure the connect and ping commands are sent correctly
+        try await withCheckedThrowingContinuation { continuation in
+            self.connectionEstablishedContinuation = continuation
+            Task {
+                do {
+                    try await self.write(operation: ClientOp.connect(initialConnect))
+                    try await self.write(operation: ClientOp.ping)
+                    self.channel?.flush()
+                } catch {
+                    continuation.resume(throwing: error)
+                }
             }
         }
     }
-}
-
+    
     /// Initializes a connection to the specified server URL.
     /// Handles TLS, WebSocket, and standard connections with proper error handling.
     private func bootstrapConnection(
@@ -668,7 +665,7 @@ private func connectToServer(s: URL) async throws {
         upgradePromise: EventLoopPromise<Void>
     ) -> EventLoopFuture<Void> {
         logger.debug("Nats ---->Setting up WebSocket connection...")
-
+        
         let httpUpgradeRequestHandler = HTTPUpgradeRequestHandler(
             host: server.host ?? "localhost",
             path: server.path,
@@ -747,9 +744,9 @@ private func connectToServer(s: URL) async throws {
             return channel.eventLoop.makeFailedFuture(error)
         }
     }
-
+    
     // MARK: - Utility Functions
-
+    
     /// **Change Explanation:**
     /// - Made server URL updates thread-safe.
     /// - Prevented duplicates in the server list.
@@ -765,9 +762,9 @@ private func connectToServer(s: URL) async throws {
         }
         logger.debug("Nats ---->Server list updated: \(self.urls.map { $0.absoluteString })")
     }
-
+    
     // MARK: - Connection Lifecycle
-
+    
     /// **Change Explanation:**
     /// - Improved the close method to ensure clean cancellation of tasks and proper state updates.
     /// - Added comments explaining resource cleanup and event firing.
@@ -775,31 +772,31 @@ private func connectToServer(s: URL) async throws {
     func close() async throws {
         self.reconnectTask?.cancel()
         await self.reconnectTask?.value
-
+        
         // Ensure the event loop is valid before proceeding
         guard let eventLoop = self.channel?.eventLoop else {
             throw NatsError.ClientError.internalError("Channel should not be nil")
         }
         
         let promise = eventLoop.makePromise(of: Void.self)
-
+        
         eventLoop.execute {
             self.state = .closed
             self.pingTask?.cancel()
             self.channel?.close(mode: .all, promise: promise)
         }
-
+        
         do {
             try await promise.futureResult.get()
         } catch ChannelError.alreadyClosed {
             // Avoid throwing errors for already closed channels
             logger.debug("Nats ---->Channel already closed, no action needed.")
         }
-
+        
         self.fire(.closed)
         logger.debug("Nats ---->Connection closed successfully.")
     }
-
+    
     /// **Change Explanation:**
     /// - Refactored `disconnect` to ensure clean disconnection without unexpected errors.
     /// - Added comments to clarify state handling.
@@ -809,7 +806,7 @@ private func connectToServer(s: URL) async throws {
         try await self.channel?.close().get()
         logger.debug("Nats ---->Disconnected from server.")
     }
-
+    
     /// **Change Explanation:**
     /// - Improved `suspend` to ensure predictable state transitions.
     /// - Added comments for better clarity.
@@ -817,13 +814,13 @@ private func connectToServer(s: URL) async throws {
     func suspend() async throws {
         self.reconnectTask?.cancel()
         await self.reconnectTask?.value
-
+        
         guard let eventLoop = self.channel?.eventLoop else {
             throw NatsError.ClientError.internalError("Channel should not be nil")
         }
         
         let promise = eventLoop.makePromise(of: Void.self)
-
+        
         eventLoop.execute {
             if self.state == .connected {
                 self.state = .suspended
@@ -834,12 +831,12 @@ private func connectToServer(s: URL) async throws {
                 promise.succeed()
             }
         }
-
+        
         try await promise.futureResult.get()
         self.fire(.suspended)
         logger.debug("Nats ---->Connection suspended successfully.")
     }
-
+    
     /// **Change Explanation:**
     /// - Added explicit validation for suspended state before attempting to resume.
     /// - Clarified state checks with detailed comments.
@@ -858,7 +855,7 @@ private func connectToServer(s: URL) async throws {
         }.get()
         logger.debug("Nats ---->Connection resumed successfully.")
     }
-
+    
     /// **Change Explanation:**
     /// - Improved reconnect logic to handle all edge cases cleanly.
     /// - Added clear separation between suspend and resume processes.
@@ -868,9 +865,9 @@ private func connectToServer(s: URL) async throws {
         try await resume()
         logger.debug("Nats ---->Reconnected successfully.")
     }
-
+    
     // MARK: - Ping Management
-
+    
     /// **Change Explanation:**
     /// - Enhanced ping handling logic to include retry limits.
     /// - Prevented infinite retries by checking the ping counter.
@@ -892,15 +889,15 @@ private func connectToServer(s: URL) async throws {
             logger.error("Unable to send ping: \(error)")
         }
     }
-
+    
     func channelActive(context: ChannelHandlerContext) {
         logger.debug("Nats ---->TCP channel active")
-
+        
         inputBuffer = context.channel.allocator.buffer(capacity: 1024 * 1024 * 8)
     }
-
+    
     // MARK: - Channel State Handlers
-
+    
     /// **Change Explanation:**
     /// - Added safeguards for inactive state transitions.
     /// - Clarified the role of `handleDisconnect`.
@@ -911,7 +908,7 @@ private func connectToServer(s: URL) async throws {
             handleDisconnect()
         }
     }
-
+    
     /// **Change Explanation:**
     /// - Improved error handling to ensure no state mismatch occurs.
     /// - Clear distinction between recoverable and unrecoverable errors.
@@ -925,40 +922,39 @@ private func connectToServer(s: URL) async throws {
         } else {
             logger.error("Unexpected error: \(error)")
         }
-
+        
         if let continuation = self.serverInfoContinuation {
             self.serverInfoContinuation = nil
             continuation.resume(throwing: error)
             return
         }
-
+        
         if let continuation = self.connectionEstablishedContinuation {
             self.connectionEstablishedContinuation = nil
             continuation.resume(throwing: error)
             return
         }
-
+        
         if self.state == .pending {
             handleDisconnect()
         } else if self.state == .disconnected {
             handleReconnect()
         }
     }
-
+    
     /// Handles the disconnection logic for the client.
     /// Ensures proper cleanup, state management, and error handling.
     func handleDisconnect() {
         logger.debug("Nats ---->Starting handleDisconnect process...")
         
-        // Ensure state changes only if the channel is valid
+        // Ensure valid channel state
         guard let channel = self.channel else {
-            logger.debug("Nats ---->handleDisconnect called but no active channel exists.")
+            logger.debug("Nats ---->No active channel found during handleDisconnect.")
             self.state = .disconnected
-            handleReconnect()
+            self.handleReconnect()
             return
         }
         
-        // Create a promise to ensure proper event loop handling
         let promise = channel.eventLoop.makePromise(of: Void.self)
         
         Task {
@@ -967,38 +963,33 @@ private func connectToServer(s: URL) async throws {
                 try await self.disconnect()
                 promise.succeed()
             } catch ChannelError.alreadyClosed {
-                // Channel already closed; resolve promise gracefully
-                logger.debug("Nats ---->Channel was already closed during disconnect.")
+                logger.debug("Nats ---->Channel already closed, resolving promise gracefully.")
                 promise.succeed()
             } catch is CancellationError {
-                // Handle task cancellation explicitly
-                logger.debug("Nats ---->Disconnect task was cancelled.")
+                logger.debug("Nats ---->Disconnect task was explicitly cancelled.")
                 promise.fail(CancellationError())
             } catch {
-                // Handle any other unexpected errors
-                logger.error("Error occurred during disconnect: \(error)")
+                logger.error("Nats ---->Unexpected error during disconnect: \(error)")
                 promise.fail(error)
             }
         }
         
-        // Ensure proper cleanup after disconnect
         promise.futureResult.whenComplete { result in
             switch result {
             case .success:
                 self.state = .disconnected
                 self.fire(.disconnected)
-                logger.info("Disconnected successfully.")
+                logger.debug("Nats ---->Disconnected successfully.")
             case .failure(let error):
-                logger.error("Failed to disconnect properly: \(error)")
+                logger.error("Nats ---->Failed to disconnect cleanly: \(error)")
             }
             
-            // Trigger reconnection only after ensuring cleanup
             self.handleReconnect()
         }
     }
-
+    
     // MARK: - Reconnect Handling
-
+    
     /// **Change Explanation:**
     /// - Improved logic for reconnect attempts.
     /// - Added clear comments for retry strategies.
@@ -1007,7 +998,7 @@ private func connectToServer(s: URL) async throws {
         reconnectTask = Task {
             var reconnected = false
             while !Task.isCancelled &&
-                (maxReconnects == nil || self.reconnectAttempts < maxReconnects!) {
+                    (maxReconnects == nil || self.reconnectAttempts < maxReconnects!) {
                 do {
                     try await self.connect()
                 } catch _ as CancellationError {
@@ -1020,7 +1011,7 @@ private func connectToServer(s: URL) async throws {
                 reconnected = true
                 break
             }
-
+            
             if Task.isCancelled {
                 return
             }
@@ -1033,7 +1024,7 @@ private func connectToServer(s: URL) async throws {
                     logger.error("Error during forced disconnect: \(error)")
                 }
             }
-
+            
             for (sid, sub) in self.subscriptions {
                 do {
                     try await write(operation: ClientOp.subscribe((sid, sub.subject, nil)))
@@ -1041,16 +1032,16 @@ private func connectToServer(s: URL) async throws {
                     logger.error("Error recreating subscription \(sid): \(error)")
                 }
             }
-
+            
             self.channel?.eventLoop.execute {
                 self.state = .connected
                 self.fire(.connected)
             }
         }
     }
-
+    
     // MARK: - Safeguards
-
+    
     /// **Change Explanation:**
     /// - Ensured `write` method handles buffer availability properly.
     /// - Improved exception handling for async operations.
@@ -1067,9 +1058,9 @@ private func connectToServer(s: URL) async throws {
             throw NatsError.ClientError.io(error)
         }
     }
-
+    
     // MARK: - Subscription Management
-
+    
     /// **Change Explanation:**
     /// - Added queue support in `subscribe`.
     /// - Ensured thread safety for subscription state updates.
@@ -1086,7 +1077,7 @@ private func connectToServer(s: URL) async throws {
         logger.debug("Nats ---->Subscribed to subject: \(subject) with sid: \(sid)")
         return sub
     }
-
+    
     /// **Change Explanation:**
     /// - Improved `unsubscribe` logic to handle edge cases.
     /// - Prevented premature subscription removal when `max` is specified.
@@ -1102,7 +1093,7 @@ private func connectToServer(s: URL) async throws {
             logger.debug("Nats ---->Unsubscribed from subject: \(sub.subject)")
         }
     }
-
+    
     /// **Change Explanation:**
     /// - Ensured thread safety when removing a subscription.
     /// - Guaranteed cleanup of subscription resources.
@@ -1188,7 +1179,7 @@ public enum NatsEvent {
     case closed
     case lameDuckMode
     case error(NatsErrorProtocol)
-
+    
     public func kind() -> NatsEventKind {
         switch self {
         case .connected:
