@@ -19,6 +19,7 @@ import NIOHTTP1
 import NIOSSL
 import NIOWebSocket
 import NKeys
+import UIKit
 
 class ConnectionHandler: ChannelInboundHandler {
     let lang = "Swift"
@@ -62,6 +63,9 @@ class ConnectionHandler: ChannelInboundHandler {
     
     private var serverInfoContinuation: CheckedContinuation<ServerInfo, Error>?
     private var connectionEstablishedContinuation: CheckedContinuation<Void, Error>?
+    private var reconnectTask: Task<(), Never>? = nil
+    private var isAppInBackground = false
+    private var pingTaskPaused = false
     
     private let pingQueue = ConcurrentQueue<RttCommand>()
     private(set) var batchBuffer: BatchBuffer?
